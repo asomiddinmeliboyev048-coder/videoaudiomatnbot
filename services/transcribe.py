@@ -1,64 +1,46 @@
 import os
 import asyncio
+import logging
 from groq import Groq
 from config import GROQ_API_KEY
 
+# Loglarni sozlash
+logger = logging.getLogger(__name__)
+
+# Groq mijozini yaratish
 client = Groq(api_key=GROQ_API_KEY)
 
 async def process_audio(audio_path: str) -> str:
     """
-    Ovozni matnga o'girish va chalkashliklarni bartaraf etish.
+    Ovozni matnga o'girish. 
+    Ovoz qaysi tilda bo'lsa, o'sha tilda matn qaytaradi (tarjima qilmaydi).
     """
     try:
-        # 1. Whisper transkripsiyasi (Qat'iy o'zbek tilida)
-        with open(audio_path, "rb") as audio_file:
-            response = client.audio.transcriptions.create(
-                model="whisper-large-v3",
-                file=audio_file,
-                language="uz", # Avtomatik aniqlashni o'chirib, 'uz' qo'yamiz
-                response_format="verbose_json", # Til haqida ma'lumot olish uchun
-                prompt="Bu o'zbek tilidagi audio: men, sen, u, biz, siz, ular, yaxshi, rahmat."
-            )
+        # Fayl mavjudligini tekshirish
+        if not os.path.exists(audio_path):
+            logger.error(f"Fayl topilmadi: {audio_path}")
+            return ""
+
+        # Groq sinxron kutubxona bo'lgani uchun uni executor ichida ishlatamiz
+        loop = asyncio.get_event_loop()
         
-        # Whisper ba'zida baribir boshqa tilni aniqlab yuborishi mumkin
-        detected_lang = response.language.lower() if hasattr(response, 'language') else "uzbek"
-        raw_text = response.text.strip()
-        
+        def transcribe():
+            with open(audio_path, "rb") as audio_file:
+                # Transcriptions metodi ovozni o'z tilida yozib beradi
+                return client.audio.transcriptions.create(
+                    model="whisper-large-v3",
+                    file=(os.path.basename(audio_path), audio_file.read()),
+                    response_format="text" # To'g'ridan-to'g'ri matn qaytaradi
+                )
+
+        # AI so'rovini yuboramiz
+        raw_text = await loop.run_in_executor(None, transcribe)
+
         if not raw_text:
             return ""
 
-        # 2. Llama tahriri - Agar Whisper adashgan bo'lsa, uni to'g'irlaydi
-        # Skrinshotingizdagi "Urdu" yoki "Kazakh" xatoliklarini mana shu qism tozalaydi
-        final_text = await force_uzbek_correction(raw_text)
-        
-        return final_text
+        return raw_text.strip()
 
     except Exception as e:
-        print(f"Xatolik: {e}")
+        logger.error(f"Transkripsiya xatoligi: {e}")
         return ""
-
-async def force_uzbek_correction(text: str) -> str:
-    """
-    Har qanday tushunarsiz yoki boshqa tildagi matnni o'zbekcha lotinga majburlaydi.
-    """
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Siz faqat o'zbek tili (lotin alifbosi) bo'yicha mutaxassissiz. "
-                        "QOIDA: Sizga qanday tilda matn berilishidan qat'iy nazar, "
-                        "uni mantiqan o'zbekcha lotin alifbosiga o'giring yoki tahrirlang. "
-                        "Agar matn mutlaqo tushunarsiz bo'lsa (shovqin bo'lsa), uni o'zbekcha so'zlar bilan mazmunli qiling. "
-                        "Faqat toza o'zbekcha matnni qaytaring, ortiqcha izohsiz."
-                    )
-                },
-                {"role": "user", "content": text}
-            ],
-            temperature=0.1 # Ijodiylikni minimal qilish
-        )
-        return response.choices[0].message.content.strip()
-    except:
-        return text
