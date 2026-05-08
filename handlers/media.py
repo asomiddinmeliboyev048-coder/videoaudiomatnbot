@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from aiogram import Router, Bot, F
 from aiogram.types import (
     Message, CallbackQuery,
@@ -7,6 +8,10 @@ from aiogram.types import (
     FSInputFile
 )
 
+# Groq kutubxonasi
+from groq import Groq
+
+from config import BOT_TOKEN, GROQ_API_KEY
 from handlers.subscription import check_subscription
 from handlers.start import get_subscribe_keyboard
 from services.transcribe import process_audio
@@ -16,6 +21,9 @@ from utils.helpers import get_temp_path, cleanup_file
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+# Groq mijozini sozlash
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 file_store: dict = {}
 counter = 0
@@ -41,6 +49,43 @@ def get_video_keyboard(key: str):
 async def send_long_text(message: Message, text: str, chunk_size: int = 4000):
     for i in range(0, len(text), chunk_size):
         await message.answer(text[i:i + chunk_size])
+
+# ─── SAVOLLARA JAVOB BERISH (AI) ──────────────────────────────────────────────
+
+@router.message(F.text & ~F.text.startswith('/'))
+async def handle_ai_question(message: Message, bot: Bot):
+    # Obunani tekshirish
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("🔒 Avval kanalga a'zo bo'ling:", reply_markup=get_subscribe_keyboard())
+        return
+
+    if not groq_client:
+        await message.answer("⚠️ Savollarga javob berish xizmati vaqtincha ishlamayapti (API kalit topilmadi).")
+        return
+
+    processing = await message.answer("🤔 O'ylayapman...")
+
+    try:
+        # Groq AI ga so'rov yuborish
+        completion = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {"role": "system", "content": "Siz foydali va aqlli Telegram botisiz. Foydalanuvchi savollariga o'zbek tilida aniq javob bering."},
+                {"role": "user", "content": message.text}
+            ],
+            temperature=0.7,
+            max_tokens=1024,
+        )
+        
+        response_text = completion.choices[0].message.content
+        await processing.delete()
+        
+        # Javobni yuborish (Markdown formatda)
+        await message.answer(response_text, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"AI Error: {e}")
+        await processing.edit_text("❌ Kechirasiz, savolingizga javob topishda xatolik yuz berdi.")
 
 # ─── VIDEO ────────────────────────────────────────────────────────────────────
 
@@ -81,16 +126,12 @@ async def handle_voice(message: Message, bot: Bot):
     try:
         file = await bot.get_file(message.voice.file_id)
         await bot.download_file(file.file_path, destination=audio_path)
-
-        # Yangilangan asinxron process_audio funksiyasini chaqiramiz
         text = await process_audio(audio_path)
-
         await processing.delete()
 
         if not text or not text.strip():
             await message.answer("⚠️ Ovozli xabarda matn topilmadi.")
         else:
-            # Sarlavha yuborish va keyin matnni o'zini yuborish
             await message.answer("🎤 <b>Ovozli xabar matni:</b>", parse_mode="HTML")
             await send_long_text(message, text)
             await message.answer("✅ @ovozli1_bot orqali matnni ovozli qilib oling!")
@@ -114,8 +155,6 @@ async def handle_photo(message: Message, bot: Bot):
     try:
         file = await bot.get_file(message.photo[-1].file_id)
         await bot.download_file(file.file_path, destination=image_path)
-
-        # OCR funksiyasi hali sinxron bo'lishi mumkin, shuning uchun run_in_executor qoladi
         text = await asyncio.get_event_loop().run_in_executor(None, extract_text_from_image, image_path)
 
         await processing.delete()
@@ -131,7 +170,7 @@ async def handle_photo(message: Message, bot: Bot):
     finally:
         cleanup_file(image_path)
 
-# ─── CALLBACK: MATNNI OLISH (VIDEO UCHUN) ──────────────────────────────────────
+# ─── CALLBACKLAR ──────────────────────────────────────────────────────────────
 
 @router.callback_query(lambda c: c.data and c.data.startswith("vt:"))
 async def get_text_callback(callback: CallbackQuery, bot: Bot):
@@ -150,13 +189,8 @@ async def get_text_callback(callback: CallbackQuery, bot: Bot):
     try:
         file = await bot.get_file(file_id)
         await bot.download_file(file.file_path, destination=video_path)
-
-        # Audioni ajratib olish (sinxron xizmat bo'lsa run_in_executor qoladi)
         await asyncio.get_event_loop().run_in_executor(None, extract_audio_from_video, video_path, audio_path)
-
-        # Transkripsiya (asinxron funksiya)
         text = await process_audio(audio_path)
-
         await processing.delete()
 
         if not text:
@@ -171,8 +205,6 @@ async def get_text_callback(callback: CallbackQuery, bot: Bot):
     finally:
         cleanup_file(video_path)
         cleanup_file(audio_path)
-
-# ─── CALLBACK: AUDIONI OLISH ──────────────────────────────────────────────────
 
 @router.callback_query(lambda c: c.data and c.data.startswith("va:"))
 async def get_audio_callback(callback: CallbackQuery, bot: Bot):
@@ -191,9 +223,7 @@ async def get_audio_callback(callback: CallbackQuery, bot: Bot):
     try:
         file = await bot.get_file(file_id)
         await bot.download_file(file.file_path, destination=video_path)
-
         await asyncio.get_event_loop().run_in_executor(None, extract_audio_from_video, video_path, audio_path)
-
         await processing.edit_text("✅ Audio tayyor! Yuborilmoqda...")
         audio_file = FSInputFile(audio_path, filename="audio.mp3")
         await callback.message.answer_audio(audio=audio_file, caption="🎵 Videodan ajratilgan audio\n✅ @MatnOvozBot")
