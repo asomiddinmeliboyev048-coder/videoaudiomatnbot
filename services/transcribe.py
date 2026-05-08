@@ -12,8 +12,8 @@ client = Groq(api_key=GROQ_API_KEY)
 
 async def process_audio(audio_path: str) -> str:
     """
-    Ovozni matnga o'girish. 
-    Ovoz qaysi tilda bo'lsa, o'sha tilda matn qaytaradi (tarjima qilmaydi).
+    Ovozni matnga o'girish. O'zbek tili grammatikasiga urg'u berilgan.
+    Ovozli xabar va videolar uchun universal transkripsiya.
     """
     try:
         # Fayl mavjudligini tekshirish
@@ -30,7 +30,9 @@ async def process_audio(audio_path: str) -> str:
                 return client.audio.transcriptions.create(
                     model="whisper-large-v3",
                     file=(os.path.basename(audio_path), audio_file.read()),
-                    response_format="text" # To'g'ridan-to'g'ri matn qaytaradi
+                    # Prompt - Whisper'ni o'zbek tiliga moslashga majbur qiladi
+                    prompt="Bu o'zbek tilidagi audio. Men, sen, u, biz, siz, ular. O'zbek tili qoidalariga amal qilinsin.",
+                    response_format="text"
                 )
 
         # AI so'rovini yuboramiz
