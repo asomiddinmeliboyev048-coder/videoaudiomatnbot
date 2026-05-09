@@ -178,4 +178,69 @@ async def get_text_callback(callback: CallbackQuery, bot: Bot):
         cleanup_file(video_path)
         cleanup_file(audio_path)
 
-# (handle_photo va get_audio_callback kodi o'zgarishsiz qoladi...)
+# ─── RASM (PHOTO) ─────────────────────────────────────────────────────────────
+
+@router.message(F.photo)
+async def handle_photo(message: Message, bot: Bot):
+    if not await check_subscription(bot, message.from_user.id):
+        await message.answer("🔒 Avval kanalga a'zo bo'ling:", reply_markup=get_subscribe_keyboard())
+        return
+
+    processing = await message.answer("🔍 Rasmdagi matn o'qilmoqda...")
+    image_path = get_temp_path("jpg")
+
+    try:
+        # Eng yuqori sifatli rasmni yuklab olish
+        file = await bot.get_file(message.photo[-1].file_id)
+        await bot.download_file(file.file_path, destination=image_path)
+        
+        # OCR xizmatini asinxron ishlatish
+        loop = asyncio.get_event_loop()
+        text = await loop.run_in_executor(None, extract_text_from_image, image_path)
+
+        await processing.delete()
+
+        if not text or not text.strip():
+            await message.answer("⚠️ Rasmdan hech qanday matn topilmadi.")
+        else:
+            await message.answer("✅ **Rasmdan aniqlangan matn:**")
+            await send_long_text(message, text)
+
+    except Exception as e:
+        logger.error(f"OCR Error: {e}")
+        await processing.edit_text(f"❌ Rasmni tahlil qilishda xatolik yuz berdi.")
+    finally:
+        cleanup_file(image_path)
+
+# ─── CALLBACKLAR (VIDEO AUDIOSI UCHUN) ────────────────────────────────────────
+
+@router.callback_query(lambda c: c.data and c.data.startswith("va:"))
+async def get_audio_callback(callback: CallbackQuery, bot: Bot):
+    key = callback.data[3:]
+    file_id = get_file_id(key)
+    await callback.answer()
+
+    if not file_id:
+        await callback.message.answer("❌ Video topilmadi.")
+        return
+
+    processing = await callback.message.answer("⏳ Audio ajratilmoqda...")
+    video_path = get_temp_path("mp4")
+    audio_path = get_temp_path("mp3")
+
+    try:
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, destination=video_path)
+        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, extract_audio_from_video, video_path, audio_path)
+        
+        audio_file = FSInputFile(audio_path, filename="audio.mp3")
+        await callback.message.answer_audio(audio=audio_file, caption="🎵 Videodan ajratilgan audio")
+        await processing.delete()
+
+    except Exception as e:
+        await processing.edit_text(f"❌ Xatolik: {str(e)}")
+    finally:
+        cleanup_file(video_path)
+        cleanup_file(audio_path)
