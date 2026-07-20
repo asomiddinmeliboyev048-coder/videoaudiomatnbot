@@ -1,13 +1,17 @@
-import base64
 import logging
 import os
 from functools import lru_cache
 
-from groq import Groq
+import google.generativeai as genai
 
-from config import GROQ_API_KEY, GROQ_TIMEOUT_SECONDS, OCR_MODEL
+from config import GEMINI_API_KEY
 
 logger = logging.getLogger(__name__)
+
+# gemini-1.5-flash o'chirilgan. Modelni deployment environment orqali
+# kodni o'zgartirmasdan almashtirish mumkin.
+GEMINI_OCR_MODEL = os.getenv("GEMINI_OCR_MODEL", "gemini-2.5-flash")
+GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "120"))
 
 _NO_TEXT_MARKERS = {
     "<no_text>",
@@ -16,18 +20,27 @@ _NO_TEXT_MARKERS = {
     "no text found",
 }
 
+_OCR_PROMPT = (
+    "Rasmdagi barcha ko'rinadigan matnni aynan qanday yozilgan bo'lsa, "
+    "o'sha tartibda ko'chirib yoz. Matn qaysi tilda va qaysi alifboda "
+    "bo'lsa, aynan shu til va alifboda qoldir. Tarjima qilma, imlosini "
+    "tuzatma, mazmunini o'zgartirma. Hech qanday izoh, sarlavha, Markdown "
+    "yoki kod bloki qo'shma. Qatorlar va abzatslarni imkon qadar saqla. "
+    "Agar rasmda matn bo'lmasa, faqat <NO_TEXT> yoz."
+)
+
 
 class OCRServiceError(RuntimeError):
     """Rasmni o'qish xizmati ishlamaganida ko'tariladi."""
 
 
 @lru_cache(maxsize=1)
-def _get_client() -> Groq:
-    if not GROQ_API_KEY:
-        raise OCRServiceError("GROQ_API_KEY sozlanmagan.")
-    # SDK'ning standart timeout va retry sozlamalari ishlatiladi. Avval ishlagan
-    # request bilan moslikni saqlash uchun max_retries majburan o'zgartirilmaydi.
-    return Groq(api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT_SECONDS)
+def _get_model():
+    if not GEMINI_API_KEY:
+        raise OCRServiceError("GEMINI_API_KEY sozlanmagan.")
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    return genai.GenerativeModel(GEMINI_OCR_MODEL)
 
 
 def _image_mime_type(image_bytes: bytes) -> str:
@@ -40,8 +53,31 @@ def _image_mime_type(image_bytes: bytes) -> str:
     raise OCRServiceError("Faqat JPG, PNG va WEBP rasmlar qo'llab-quvvatlanadi.")
 
 
+def _response_text(response) -> str:
+    """Gemini javobidan matnni SDK response turidan xavfsiz ajratadi."""
+    try:
+        return (response.text or "").strip()
+    except (AttributeError, ValueError):
+        parts = []
+        for candidate in getattr(response, "candidates", None) or []:
+            content = getattr(candidate, "content", None)
+            for part in getattr(content, "parts", None) or []:
+                text = getattr(part, "text", None)
+                if text:
+                    parts.append(text)
+        return "\n".join(parts).strip()
+
+
 def _normalize_result(text: str) -> str:
     normalized = text.strip()
+
+    # Model ko'rsatmaga qaramay butun javobni code fence ichiga olsa, faqat
+    # tashqi Markdown qobig'ini olib tashlaymiz; OCR matnining o'zi o'zgarmaydi.
+    lines = normalized.splitlines()
+    if len(lines) >= 2 and lines[0].strip().startswith("```"):
+        if lines[-1].strip() == "```":
+            normalized = "\n".join(lines[1:-1]).strip()
+
     comparable = normalized.casefold().strip(" .!?'\"`")
     if not normalized or comparable in _NO_TEXT_MARKERS:
         return ""
@@ -49,7 +85,7 @@ def _normalize_result(text: str) -> str:
 
 
 def extract_text_from_image(image_path: str) -> str:
-    """Rasmdagi matnni tarjima qilmasdan, aynan asl tilida o'qiydi."""
+    """Rasmdagi matnni Gemini Vision orqali aynan asl tilida OCR qiladi."""
     if not os.path.isfile(image_path):
         raise OCRServiceError(f"Rasm fayli topilmadi: {image_path}")
 
@@ -61,50 +97,30 @@ def extract_text_from_image(image_path: str) -> str:
             raise OCRServiceError("Rasm fayli bo'sh.")
 
         mime_type = _image_mime_type(image_bytes)
-        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        image_part = {
+            "mime_type": mime_type,
+            "data": image_bytes,
+        }
 
-        # Image-first tartibi va Scout modeli botning avval ishlagan Groq Vision
-        # request shakliga qaytarildi. Telegram photo bu yerga bytes sifatida keladi.
-        response = _get_client().chat.completions.create(
-            model=OCR_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": (
-                                    f"data:{mime_type};base64,{base64_image}"
-                                )
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                "Rasmdagi barcha ko'rinadigan matnni to'liq va "
-                                "aniq ko'chirib yoz. Matnni tarjima qilma va tilini "
-                                "o'zgartirma. Faqat rasmdagi matnni yoz, izoh yoki "
-                                "Markdown qo'shma. Hech qanday matn bo'lmasa faqat "
-                                "<NO_TEXT> yoz."
-                            ),
-                        },
-                    ],
-                }
-            ],
-            temperature=0.0,
-            max_tokens=3000,
+        response = _get_model().generate_content(
+            [_OCR_PROMPT, image_part],
+            generation_config={
+                "temperature": 0.0,
+                "candidate_count": 1,
+                "max_output_tokens": 4096,
+            },
+            request_options={"timeout": GEMINI_TIMEOUT_SECONDS},
         )
 
-        content = response.choices[0].message.content or ""
-        logger.info("OCR tugadi: model=%s", OCR_MODEL)
-        return _normalize_result(content)
+        text = _normalize_result(_response_text(response))
+        logger.info("Gemini OCR tugadi: model=%s", GEMINI_OCR_MODEL)
+        return text
     except OCRServiceError:
         raise
     except Exception as exc:
         logger.exception(
-            "Groq OCR xatoligi: model=%s, status=%s",
-            OCR_MODEL,
-            getattr(exc, "status_code", "noma'lum"),
+            "Gemini OCR xatoligi: model=%s, xato_turi=%s",
+            GEMINI_OCR_MODEL,
+            type(exc).__name__,
         )
         raise OCRServiceError("Rasmni o'qish xizmati ishlamadi.") from exc
