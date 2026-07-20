@@ -1,4 +1,5 @@
 import os
+import tempfile
 
 from dotenv import load_dotenv
 
@@ -11,26 +12,17 @@ CHANNEL_ID = os.getenv("CHANNEL_ID")  # masalan: @mening_kanalim
 CHANNEL_LINK = os.getenv("CHANNEL_LINK")  # masalan: https://t.me/mening_kanalim
 
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-TEMP_DIR = os.getenv("TEMP_DIR", "temp_files")
-GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "120"))
+# /tmp kabi system temp katalogi deploylarda odatda yozish uchun ochiq bo'ladi.
+TEMP_DIR = os.getenv(
+    "TEMP_DIR",
+    os.path.join(tempfile.gettempdir(), "videoaudiomatnbot"),
+)
+TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "whisper-large-v3")
 MAX_TRANSCRIPTION_FILE_SIZE_MB = int(
     os.getenv("MAX_TRANSCRIPTION_FILE_SIZE_MB", "24")
 )
-TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "whisper-large-v3")
-
-# Birinchi model ishlamasa, vergul bilan ajratilgan keyingi modellar sinab ko'riladi.
-# Model nomlarini deployment environment orqali kodni o'zgartirmasdan yangilash mumkin.
-OCR_MODELS = tuple(
-    model.strip()
-    for model in os.getenv(
-        "OCR_MODELS",
-        (
-            "meta-llama/llama-4-maverick-17b-128e-instruct,"
-            "meta-llama/llama-4-scout-17b-16e-instruct"
-        ),
-    ).split(",")
-    if model.strip()
+GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "120"))
+OCR_MODEL = os.getenv(
+    "OCR_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
 )
-
-if not OCR_MODELS:
-    raise ValueError("OCR_MODELS kamida bitta model nomini o'z ichiga olishi kerak.")
+FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
