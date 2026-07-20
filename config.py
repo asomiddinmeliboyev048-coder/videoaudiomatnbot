@@ -23,5 +23,5 @@ MAX_TRANSCRIPTION_FILE_SIZE_MB = int(
 )
 GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "120"))
 # MANA SHU QATOR YANGILANDI: preview o'rniga instruct yozildi
-OCR_MODEL = os.getenv("OCR_MODEL", "llama-3.2-11b-vision-instruct")
+OCR_MODEL = os.getenv("OCR_MODEL", "llama-3.2-90b-vision")
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
