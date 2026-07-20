@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 
 from aiogram import Router, Bot, F
 from aiogram.types import (
@@ -12,11 +11,7 @@ from aiogram.types import (
 # Groq kutubxonasi
 from groq import Groq
 
-from config import (
-    GROQ_API_KEY,
-    MAX_FILE_SIZE_MB,
-    MAX_TRANSCRIPTION_FILE_SIZE_MB,
-)
+from config import GROQ_API_KEY, MAX_FILE_SIZE_MB
 from handlers.subscription import check_subscription
 from handlers.start import get_subscribe_keyboard
 from services.transcribe import process_audio, TranscriptionError
@@ -45,7 +40,15 @@ async def get_ai_answer(question_text: str) -> str:
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "Siz aqlli yordamchisiz. Savollarga faqat o'zbek tilida, aniq va imloviy xatosiz javob bering."},
+                {
+                    "role": "system",
+                    "content": (
+                        "Foydalanuvchi qaysi tilda savol bersa, aynan shu tilda "
+                        "javob bering. Javobni boshqa tilga tarjima qilmang. "
+                        "O'zbekcha savolga ravon va imloviy to'g'ri o'zbek tilida "
+                        "javob bering."
+                    ),
+                },
                 {"role": "user", "content": question_text}
             ],
             temperature=0.6,
@@ -165,27 +168,22 @@ async def get_text_callback(callback: CallbackQuery, bot: Bot):
         "⏳ Audio tili avtomatik aniqlanib, matnga aylantirilmoqda..."
     )
     video_path = get_temp_path("mp4")
-    audio_path = get_temp_path("flac")
-    compressed_audio_path = ""
+    audio_path = get_temp_path("mp3")
 
     try:
         file = await bot.get_file(file_id)
         await bot.download_file(file.file_path, destination=video_path)
 
-        await asyncio.to_thread(
-            extract_audio_from_video, video_path, audio_path
+        # Avval ishlagan MP3 pipeline va Python 3.8+ bilan mos executor.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            extract_audio_from_video,
+            video_path,
+            audio_path,
+            True,
         )
-
-        transcription_audio_path = audio_path
-        audio_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-        if audio_size_mb > MAX_TRANSCRIPTION_FILE_SIZE_MB:
-            compressed_audio_path = get_temp_path("m4a")
-            await asyncio.to_thread(
-                extract_audio_from_video, video_path, compressed_audio_path
-            )
-            transcription_audio_path = compressed_audio_path
-
-        text = await process_audio(transcription_audio_path)
+        text = await process_audio(audio_path)
 
         if not text:
             await processing.edit_text("⚠️ Videoda nutq aniqlanmadi.")
@@ -199,15 +197,14 @@ async def get_text_callback(callback: CallbackQuery, bot: Bot):
             "Birozdan keyin qayta urinib ko'ring."
         )
     except Exception:
-        logger.exception("Videoni matnga aylantirish xatoligi")
+        logger.exception("Videoni qayta ishlash xatoligi")
         await processing.edit_text(
             "❌ Videoni qayta ishlashda xatolik yuz berdi. "
-            "Video audiosini va serverdagi ffmpeg sozlamasini tekshiring."
+            "Server logida texnik sabab saqlandi."
         )
     finally:
         cleanup_file(video_path)
         cleanup_file(audio_path)
-        cleanup_file(compressed_audio_path)
 
 # ─── RASM (PHOTO) ─────────────────────────────────────────────────────────────
 
@@ -225,8 +222,11 @@ async def handle_photo(message: Message, bot: Bot):
         file = await bot.get_file(message.photo[-1].file_id)
         await bot.download_file(file.file_path, destination=image_path)
         
-        # OCR xizmatini event loopni bloklamasdan ishlatish
-        text = await asyncio.to_thread(extract_text_from_image, image_path)
+        # Avval ishlagan executor oqimi Python 3.8+ bilan ham mos.
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(
+            None, extract_text_from_image, image_path
+        )
 
         if not text:
             await processing.edit_text("⚠️ Rasmdan hech qanday matn topilmadi.")

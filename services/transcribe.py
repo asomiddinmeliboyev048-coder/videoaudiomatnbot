@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 from functools import lru_cache
-from typing import Optional, Tuple
 
 from groq import Groq
 
@@ -24,37 +23,33 @@ class TranscriptionError(RuntimeError):
 def _get_client() -> Groq:
     if not GROQ_API_KEY:
         raise TranscriptionError("GROQ_API_KEY sozlanmagan.")
-    return Groq(
-        api_key=GROQ_API_KEY,
-        timeout=GROQ_TIMEOUT_SECONDS,
-        max_retries=2,
-    )
+    return Groq(api_key=GROQ_API_KEY, timeout=GROQ_TIMEOUT_SECONDS)
 
 
-def _extract_transcript(audio_path: str) -> Tuple[str, Optional[str]]:
+def _transcribe_sync(audio_path: str) -> str:
+    """Groq SDK'ning sinxron chaqiruvini alohida threadda bajaradi."""
     with open(audio_path, "rb") as audio_file:
         response = _get_client().audio.transcriptions.create(
             model=TRANSCRIPTION_MODEL,
-            file=(os.path.basename(audio_path), audio_file),
-            response_format="verbose_json",
+            file=(os.path.basename(audio_path), audio_file.read()),
+            response_format="text",
             temperature=0.0,
         )
 
     if isinstance(response, str):
-        return response.strip(), None
+        return response.strip()
 
-    text = getattr(response, "text", "") or ""
-    language = getattr(response, "language", None)
-    return text.strip(), language
+    # SDK versiyasiga qarab text response obyekt bo'lib qaytishi ham mumkin.
+    return (getattr(response, "text", "") or "").strip()
 
 
 async def process_audio(audio_path: str) -> str:
     """
-    Audioni tarjima qilmasdan, manba tilining o'zida matnga aylantiradi.
+    Audioni tarjima qilmasdan, avtomatik aniqlangan asl tilida transkripsiya qiladi.
 
-    Til Groq Whisper tomonidan avtomatik aniqlanadi. `language` va tilga xos
-    `prompt` ataylab yuborilmaydi: ular boshqa tillardagi audioni noto'g'ri
-    tilga majburlashi mumkin.
+    Muhim: `translations` endpointi, `language` va tilga majburlovchi `prompt`
+    ishlatilmaydi. Shu sabab Whisper o'zbek, ingliz, rus va boshqa tillarni
+    audioning o'zidan avtomatik aniqlaydi.
     """
     if not os.path.isfile(audio_path):
         raise TranscriptionError(f"Audio fayl topilmadi: {audio_path}")
@@ -63,20 +58,15 @@ async def process_audio(audio_path: str) -> str:
         raise TranscriptionError("Audio fayl bo'sh.")
     if file_size_mb > MAX_TRANSCRIPTION_FILE_SIZE_MB:
         raise TranscriptionError(
-            "Transkripsiya audiosi juda katta "
-            f"({file_size_mb:.1f} MB; maksimum "
+            "Audio fayl Groq limitidan katta: "
+            f"{file_size_mb:.1f} MB (maksimum "
             f"{MAX_TRANSCRIPTION_FILE_SIZE_MB} MB)."
         )
 
     try:
-        text, detected_language = await asyncio.to_thread(
-            _extract_transcript, audio_path
-        )
-        logger.info(
-            "Transkripsiya tugadi: model=%s, aniqlangan_til=%s",
-            TRANSCRIPTION_MODEL,
-            detected_language or "noma'lum",
-        )
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(None, _transcribe_sync, audio_path)
+        logger.info("Transkripsiya tugadi: model=%s", TRANSCRIPTION_MODEL)
         return text
     except TranscriptionError:
         raise
