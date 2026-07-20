@@ -33,6 +33,12 @@ def _transcribe_sync(audio_path: str) -> str:
             model=TRANSCRIPTION_MODEL,
             file=(os.path.basename(audio_path), audio_file.read()),
             response_format="text",
+            prompt=(
+                "Ushbu audio o'zbek yoki rus tillarida bo'lishi ehtimoli "
+                "yuqori. So'zlarni o'zgartirmasdan, aynan qaysi tilda "
+                "gapirilgan bo'lsa, xuddi shu tilning o'z alifbosida, "
+                "aniq va xatosiz yozing."
+            ),
             temperature=0.0,
         )
 
