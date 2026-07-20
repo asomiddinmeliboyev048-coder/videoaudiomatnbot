@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+
 from aiogram import Router, Bot, F
 from aiogram.types import (
     Message, CallbackQuery,
@@ -11,12 +12,16 @@ from aiogram.types import (
 # Groq kutubxonasi
 from groq import Groq
 
-from config import BOT_TOKEN, GROQ_API_KEY
+from config import (
+    GROQ_API_KEY,
+    MAX_FILE_SIZE_MB,
+    MAX_TRANSCRIPTION_FILE_SIZE_MB,
+)
 from handlers.subscription import check_subscription
 from handlers.start import get_subscribe_keyboard
-from services.transcribe import process_audio
+from services.transcribe import process_audio, TranscriptionError
 from services.extract_audio import extract_audio_from_video
-from services.ocr import extract_text_from_image
+from services.ocr import extract_text_from_image, OCRServiceError
 from utils.helpers import get_temp_path, cleanup_file
 
 logger = logging.getLogger(__name__)
@@ -134,8 +139,11 @@ async def handle_video(message: Message, bot: Bot):
         return
 
     size_mb = (message.video.file_size or 0) / (1024 * 1024)
-    if size_mb > 50:
-        await message.answer(f"❌ Fayl juda katta ({size_mb:.1f} MB). Maksimum: 50 MB.")
+    if size_mb > MAX_FILE_SIZE_MB:
+        await message.answer(
+            f"❌ Fayl juda katta ({size_mb:.1f} MB). "
+            f"Maksimum: {MAX_FILE_SIZE_MB} MB."
+        )
         return
 
     key = save_file_id(message.video.file_id)
@@ -153,30 +161,53 @@ async def get_text_callback(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("❌ Video topilmadi.")
         return
 
-    processing = await callback.message.answer("⏳ Audio matnga aylantirilmoqda (O'zbek tili ustuvor)...")
+    processing = await callback.message.answer(
+        "⏳ Audio tili avtomatik aniqlanib, matnga aylantirilmoqda..."
+    )
     video_path = get_temp_path("mp4")
-    audio_path = get_temp_path("mp3")
+    audio_path = get_temp_path("flac")
+    compressed_audio_path = ""
 
     try:
         file = await bot.get_file(file_id)
         await bot.download_file(file.file_path, destination=video_path)
-        
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, extract_audio_from_video, video_path, audio_path)
-        
-        text = await process_audio(audio_path)
-        await processing.delete()
+
+        await asyncio.to_thread(
+            extract_audio_from_video, video_path, audio_path
+        )
+
+        transcription_audio_path = audio_path
+        audio_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        if audio_size_mb > MAX_TRANSCRIPTION_FILE_SIZE_MB:
+            compressed_audio_path = get_temp_path("m4a")
+            await asyncio.to_thread(
+                extract_audio_from_video, video_path, compressed_audio_path
+            )
+            transcription_audio_path = compressed_audio_path
+
+        text = await process_audio(transcription_audio_path)
 
         if not text:
-            await callback.message.answer("⚠️ Videoda nutq aniqlanmadi.")
+            await processing.edit_text("⚠️ Videoda nutq aniqlanmadi.")
         else:
-            await callback.message.answer("✅ **Video matni:**", parse_mode="Markdown")
+            await processing.edit_text("✅ Video matni (asl tilida):")
             await send_long_text(callback.message, text)
-    except Exception as e:
-        await processing.edit_text(f"❌ Xatolik: {str(e)}")
+    except TranscriptionError:
+        logger.exception("Video transkripsiyasi xatoligi")
+        await processing.edit_text(
+            "❌ Audioni matnga aylantirish xizmati vaqtincha ishlamadi. "
+            "Birozdan keyin qayta urinib ko'ring."
+        )
+    except Exception:
+        logger.exception("Videoni matnga aylantirish xatoligi")
+        await processing.edit_text(
+            "❌ Videoni qayta ishlashda xatolik yuz berdi. "
+            "Video audiosini va serverdagi ffmpeg sozlamasini tekshiring."
+        )
     finally:
         cleanup_file(video_path)
         cleanup_file(audio_path)
+        cleanup_file(compressed_audio_path)
 
 # ─── RASM (PHOTO) ─────────────────────────────────────────────────────────────
 
@@ -194,21 +225,27 @@ async def handle_photo(message: Message, bot: Bot):
         file = await bot.get_file(message.photo[-1].file_id)
         await bot.download_file(file.file_path, destination=image_path)
         
-        # OCR xizmatini asinxron ishlatish
-        loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(None, extract_text_from_image, image_path)
+        # OCR xizmatini event loopni bloklamasdan ishlatish
+        text = await asyncio.to_thread(extract_text_from_image, image_path)
 
-        await processing.delete()
-
-        if not text or not text.strip():
-            await message.answer("⚠️ Rasmdan hech qanday matn topilmadi.")
+        if not text:
+            await processing.edit_text("⚠️ Rasmdan hech qanday matn topilmadi.")
         else:
-            await message.answer("✅ **Rasmdan aniqlangan matn:**")
+            await processing.edit_text("✅ Rasmdan aniqlangan matn (asl tilida):")
             await send_long_text(message, text)
 
-    except Exception as e:
-        logger.error(f"OCR Error: {e}")
-        await processing.edit_text(f"❌ Rasmni tahlil qilishda xatolik yuz berdi.")
+    except OCRServiceError:
+        logger.exception("OCR xizmati xatoligi")
+        await processing.edit_text(
+            "❌ Rasmni o'qish xizmati vaqtincha ishlamadi. "
+            "Birozdan keyin qayta urinib ko'ring."
+        )
+    except Exception:
+        logger.exception("Rasmni qayta ishlash xatoligi")
+        await processing.edit_text(
+            "❌ Rasmni tahlil qilishda xatolik yuz berdi. "
+            "JPG, PNG yoki WEBP formatidagi rasm yuboring."
+        )
     finally:
         cleanup_file(image_path)
 
