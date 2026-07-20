@@ -23,6 +23,6 @@ MAX_TRANSCRIPTION_FILE_SIZE_MB = int(
 )
 GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "120"))
 OCR_MODEL = os.getenv(
-    "OCR_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+    "OCR_MODEL = "llama-3.2-11b-vision-preview"
 )
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
