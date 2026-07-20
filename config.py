@@ -25,3 +25,8 @@ GROQ_TIMEOUT_SECONDS = float(os.getenv("GROQ_TIMEOUT_SECONDS", "120"))
 # MANA SHU QATOR YANGILANDI: preview o'rniga instruct yozildi
 OCR_MODEL = os.getenv("OCR_MODEL", "llama-3.2-90b-vision")
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
+
+# Har user uchun saqlanadigan oxirgi savol-javob juftlari soni.
+CHAT_HISTORY_TURNS = int(os.getenv("CHAT_HISTORY_TURNS", "8"))
+# In-memory tarix saqlanadigan eng ko'p faol foydalanuvchilar soni.
+CHAT_HISTORY_MAX_USERS = int(os.getenv("CHAT_HISTORY_MAX_USERS", "1000"))

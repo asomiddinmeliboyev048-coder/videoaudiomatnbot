@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from typing import Tuple
 
 from aiogram import Router, Bot, F
 from aiogram.types import (
@@ -11,9 +12,15 @@ from aiogram.types import (
 # Groq kutubxonasi
 from groq import Groq
 
-from config import GROQ_API_KEY, MAX_FILE_SIZE_MB
+from config import (
+    CHAT_HISTORY_MAX_USERS,
+    CHAT_HISTORY_TURNS,
+    GROQ_API_KEY,
+    MAX_FILE_SIZE_MB,
+)
 from handlers.subscription import check_subscription
 from handlers.start import get_subscribe_keyboard
+from services.chat_history import ChatConversation, InMemoryChatHistory
 from services.transcribe import process_audio, TranscriptionError
 from services.extract_audio import extract_audio_from_video
 from services.ocr import extract_text_from_image, OCRServiceError
@@ -24,40 +31,62 @@ router = Router()
 
 # Groq mijozini sozlash
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+chat_history = InMemoryChatHistory(
+    turns_per_user=CHAT_HISTORY_TURNS,
+    max_users=CHAT_HISTORY_MAX_USERS,
+)
 
 file_store: dict = {}
 counter = 0
 
 # --- YORDAMCHI AI FUNKSIYASI ---
-async def get_ai_answer(question_text: str) -> str:
-    """Groq AI dan javob olish uchun umumiy funksiya"""
+async def get_ai_answer(
+    question_text: str,
+    conversation: ChatConversation,
+) -> Tuple[str, bool]:
+    """Oldingi kontekst bilan javob va uni saqlash kerakligini qaytaradi."""
+    if not groq_client:
+        return "⚠️ API kalit sozlanmagan.", False
+
     try:
-        if not groq_client:
-            return "⚠️ API kalit sozlanmagan."
-        
-        loop = asyncio.get_event_loop()
-        # Bloklanib qolmaslik uchun executor ishlatamiz
-        completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Foydalanuvchi qaysi tilda savol bersa, aynan shu tilda "
-                        "javob bering. Javobni boshqa tilga tarjima qilmang. "
-                        "O'zbekcha savolga ravon va imloviy to'g'ri o'zbek tilida "
-                        "javob bering."
-                    ),
-                },
-                {"role": "user", "content": question_text}
-            ],
-            temperature=0.6,
-            max_tokens=1500
-        ))
-        return completion.choices[0].message.content
-    except Exception as e:
-        logger.error(f"AI Error: {e}")
-        return "Kechirasiz, savolingizni tahlil qilishda xatolik yuz berdi."
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Foydalanuvchi qaysi tilda savol bersa, aynan shu tilda "
+                    "javob bering. Javobni boshqa tilga tarjima qilmang. "
+                    "O'zbekcha savolga ravon va imloviy to'g'ri o'zbek tilida "
+                    "javob bering. Oldingi suhbat kontekstini hisobga oling."
+                ),
+            }
+        ]
+        messages.extend(conversation.get_messages())
+        messages.append({"role": "user", "content": question_text})
+
+        loop = asyncio.get_running_loop()
+        completion = await loop.run_in_executor(
+            None,
+            lambda: groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.6,
+                max_tokens=1500,
+            ),
+        )
+        answer = (completion.choices[0].message.content or "").strip()
+        if not answer:
+            return "Kechirasiz, savolingizga javob tayyorlay olmadim.", False
+
+        return answer, True
+    except Exception:
+        logger.exception(
+            "AI javobini olishda xatolik: user_id=%s",
+            conversation.user_id,
+        )
+        return (
+            "Kechirasiz, savolingizni tahlil qilishda xatolik yuz berdi.",
+            False,
+        )
 
 def save_file_id(file_id: str) -> str:
     global counter
@@ -85,53 +114,85 @@ async def send_long_text(message: Message, text: str, chunk_size: int = 4000):
 
 @router.message(F.text & ~F.text.startswith('/'))
 async def handle_ai_question(message: Message, bot: Bot):
-    if not await check_subscription(bot, message.from_user.id):
-        await message.answer("🔒 Avval kanalga a'zo bo'ling:", reply_markup=get_subscribe_keyboard())
-        return
+    async with chat_history.conversation(message.from_user.id) as conversation:
+        if not await check_subscription(bot, message.from_user.id):
+            await message.answer(
+                "🔒 Avval kanalga a'zo bo'ling:",
+                reply_markup=get_subscribe_keyboard(),
+            )
+            return
 
-    processing = await message.answer("🤔 O'ylayapman...")
-    answer = await get_ai_answer(message.text)
-    
-    await processing.delete()
-    await message.answer(answer, parse_mode="Markdown")
+        processing = await message.answer("🤔 O'ylayapman...")
+        answer, should_remember = await get_ai_answer(
+            message.text,
+            conversation,
+        )
+
+        await message.answer(answer, parse_mode="Markdown")
+        if should_remember:
+            conversation.append_turn(message.text, answer)
+        await processing.delete()
 
 # ─── OVOZLI XABAR SAVOLI (AI) ──────────────────────────────────────────────────
 
 @router.message(F.voice)
 async def handle_voice(message: Message, bot: Bot):
-    if not await check_subscription(bot, message.from_user.id):
-        await message.answer("🔒 Avval kanalga a'zo bo'ling:", reply_markup=get_subscribe_keyboard())
-        return
-
-    processing = await message.answer("🎤 Ovozli xabar eshitilmoqda...")
-    audio_path = get_temp_path("ogg")
-
-    try:
-        file = await bot.get_file(message.voice.file_id)
-        await bot.download_file(file.file_path, destination=audio_path)
-        
-        # 1. Ovozni matnga o'giramiz
-        transcript = await process_audio(audio_path)
-        
-        if not transcript or len(transcript.strip()) < 2:
-            await processing.edit_text("⚠️ Ovozli xabarni tushuna olmadim.")
+    # Lock handler boshida olinadi: text va voice javoblari kelish tartibida qoladi.
+    async with chat_history.conversation(message.from_user.id) as conversation:
+        if not await check_subscription(bot, message.from_user.id):
+            await message.answer(
+                "🔒 Avval kanalga a'zo bo'ling:",
+                reply_markup=get_subscribe_keyboard(),
+            )
             return
 
-        # 2. Foydalanuvchiga nima tushunilganini ko'rsatamiz
-        await processing.edit_text(f"📝 **Sizning savolingiz:**\n_{transcript}_\n\n⌛ **Javob tayyorlanmoqda...**", parse_mode="Markdown")
-        
-        # 3. Matnni AI'ga yuboramiz
-        ai_answer = await get_ai_answer(transcript)
-        
-        # 4. Yakuniy javob
-        await message.answer(f"🤖 **AI javobi:**\n\n{ai_answer}", parse_mode="Markdown")
-        await processing.delete()
+        processing = await message.answer("🎤 Ovozli xabar eshitilmoqda...")
+        audio_path = get_temp_path("ogg")
 
-    except Exception as e:
-        logger.error(f"Voice AI Error: {e}")
-        await processing.edit_text("❌ Ovozli xabarni ishlashda xatolik yuz berdi.")
-    finally:
-        cleanup_file(audio_path)
+        try:
+            file = await bot.get_file(message.voice.file_id)
+            await bot.download_file(file.file_path, destination=audio_path)
+
+            # 1. Ovozni matnga o'giramiz
+            transcript = await process_audio(audio_path)
+
+            if not transcript or len(transcript.strip()) < 2:
+                await processing.edit_text(
+                    "⚠️ Ovozli xabarni tushuna olmadim."
+                )
+                return
+
+            # 2. Foydalanuvchiga nima tushunilganini ko'rsatamiz
+            await processing.edit_text(
+                f"📝 **Sizning savolingiz:**\n_{transcript}_\n\n"
+                "⌛ **Javob tayyorlanmoqda...**",
+                parse_mode="Markdown",
+            )
+
+            # 3. Transkriptni shu userning oldingi konteksti bilan yuboramiz
+            ai_answer, should_remember = await get_ai_answer(
+                transcript,
+                conversation,
+            )
+
+            # 4. Javob yetkazilgandan keyingina historyga yozamiz
+            await message.answer(
+                f"🤖 **AI javobi:**\n\n{ai_answer}",
+                parse_mode="Markdown",
+            )
+            if should_remember:
+                conversation.append_turn(transcript, ai_answer)
+            await processing.delete()
+
+        except Exception:
+            logger.exception(
+                "Voice AI Error: user_id=%s", message.from_user.id
+            )
+            await processing.edit_text(
+                "❌ Ovozli xabarni ishlashda xatolik yuz berdi."
+            )
+        finally:
+            cleanup_file(audio_path)
 
 # ─── VIDEO ────────────────────────────────────────────────────────────────────
 
